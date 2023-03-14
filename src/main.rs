@@ -8,7 +8,7 @@ use std::path::Path;
 use std::{fs, path::PathBuf, ffi::OsStr};
 
 use clap::Parser;
-use image::{ImageBuffer, Rgba, ImageError, ImageOutputFormat};
+use image::{ImageBuffer, Rgba, ImageError, ImageOutputFormat, Pixel};
 use image::io::Reader as ImageReader;
 use os_str_bytes::{Pattern, RawOsStr};
 use walkdir::WalkDir;
@@ -22,7 +22,7 @@ struct ToProcess {
 }
 
 impl ToProcess {
-	fn process(&self, background: &ImageBuf) -> Result<ImageBuf, ProcessingError> {
+	fn process(&self, background: &ImageBuf, algorithm: Algorithm) -> Result<ImageBuf, ProcessingError> {
 		let shape_img = ImageReader::open(&self.shape)?.decode()?.into_rgba8();
 
 		let overlay = if let Some(overlay_path) = &self.overlay {
@@ -80,7 +80,7 @@ impl ToProcess {
 		};
 
 		let sampler = TriSampler {
-			shape_sampler, bg_sampler, overlay_sampler,
+			shape_sampler, bg_sampler, overlay_sampler, algorithm,
 			height_mod: bg_rect.w
 		};
 
@@ -88,7 +88,7 @@ impl ToProcess {
 
 		for i in 0..bg_rect.w {
 			for j in 0..bg_rect.h {
-				new_bg_buf.put_pixel(i, j, *sampler.get_pixel(i, j));
+				new_bg_buf.put_pixel(i, j, sampler.get_pixel(i, j));
 			}
 		}
 		
@@ -100,27 +100,39 @@ struct TriSampler<'a, 'b, 'c> {
 	shape_sampler: Sampler<'a>,
 	bg_sampler: Sampler<'b>,
 	overlay_sampler: Option<Sampler<'c>>,
-	height_mod: u32
+	height_mod: u32,
+	algorithm: Algorithm
 }
 
 impl TriSampler<'_, '_, '_> {
-	fn get_pixel(&self, x: u32, y: u32) -> &Rgba<u8> {
+	fn get_pixel(&self, x: u32, y: u32) -> Rgba<u8> {
 		let mod_y = y % self.height_mod;
 		if let Some(overlay) = &self.overlay_sampler {
 			let overlay_px = overlay.get_pixel(x, mod_y);
 			if overlay_px.0[3] > 0 {
-				return overlay_px;
+				return *overlay_px;
 			}
 		}
 
+		// blending algo: ((dst * (255 - a) + src * a) + 127) / 255
+		// or:  (dst * (255 - a)) / 255 + src
+		// dst = bg
+		// src = shape
+		
+		// saturation: lm + (int) (a * (bg - lm))
+
 		let shape_px = self.shape_sampler.get_pixel(x, mod_y);
 		if shape_px.0[3] > 0 {
-			return self.bg_sampler.get_pixel(x, y);
+			let bg_px = self.bg_sampler.get_pixel(x, y);
+			
+			self.algorithm.blend(bg_px, shape_px)
 		} else {
-			return &Rgba([0, 0, 0, 0]);
+			return Rgba([0, 0, 0, 0]);
 		}
 	}
 }
+
+
 
 struct Sampler<'a> {
 	img: &'a ImageBuf,
@@ -230,6 +242,64 @@ struct Args {
 	/// Interpolate (mcmeta)
 	#[arg(short)]
 	interpolate: bool,
+	/// Blending algorithm to use
+	#[arg(short, long, default_value = "gtnh", value_enum)]
+	blend: Algorithm
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Algorithm {
+	Gtnh,
+	Multiply
+}
+
+impl Algorithm {
+	fn blend(&self, bg_px: &Rgba<u8>, shape_px: &Rgba<u8>) -> Rgba<u8> {
+		match self {
+			Algorithm::Gtnh => {
+				let intermediate = Rgba([
+					cursed_blend(bg_px.0[0] as u32, shape_px.0[0] as u32, 30),
+					cursed_blend(bg_px.0[1] as u32, shape_px.0[1] as u32, 30),
+					cursed_blend(bg_px.0[2] as u32, shape_px.0[2] as u32, 30),
+					bg_px.0[3]
+				]);
+				let luma = intermediate.to_luma().0[0] as f32;
+				Rgba([
+					cursed_saturation(intermediate.0[0] as f32, luma, 1.5),
+					cursed_saturation(intermediate.0[1] as f32, luma, 1.5),
+					cursed_saturation(intermediate.0[2] as f32, luma, 1.5),
+					intermediate.0[3]
+				])
+			},
+			Algorithm::Multiply => {
+				Rgba([
+					color_mul(bg_px[0], shape_px[1]),
+					color_mul(bg_px[1], shape_px[1]),
+					color_mul(bg_px[2], shape_px[2]),
+					bg_px[3]
+				])
+			}
+		}
+	}
+}
+
+fn color_mul(c1: u8, c2: u8) -> u8 {
+	((c1 as u16 * c2 as u16) / 255) as u8
+}
+
+fn cursed_saturation(src: f32, luma: f32, factor: f32) -> u8 {
+	let val = luma + (factor * (src - luma));
+	if val > 255. {
+		255
+	} else if val < 0. {
+		0
+	} else {
+		val as u8
+	}
+}
+
+fn cursed_blend(dst: u32, src: u32, a: u32) -> u8 {
+	(((dst * (255 - a) + src * a) + 127) / 255) as u8
 }
 
 fn main() {
@@ -238,6 +308,7 @@ fn main() {
 	let output_path = args.output;
 	let shapes_path = args.shapes;
 	let texture_name = args.texture_name;
+	let algorithm = args.blend;
 
 	let mcmeta = format_mcmeta(args.frametime, args.interpolate);
 
@@ -279,14 +350,14 @@ fn main() {
 	}
 
 	for entry in files {
-		if let Err(err) = process_write(&entry, &background, &mcmeta) {
+		if let Err(err) = process_write(&entry, &background, &mcmeta, algorithm) {
 			eprintln!("Error processing file {:?}: {}", &entry.shape, err);
 		}
 	}
 }
 
-fn process_write(of: &ToProcess, background: &ImageBuf, mcmeta: &str) -> Result<(), ProcessingError> {
-	let image = of.process(background)?;
+fn process_write(of: &ToProcess, background: &ImageBuf, mcmeta: &str, algorithm: Algorithm) -> Result<(), ProcessingError> {
+	let image = of.process(background, algorithm)?;
 	let mut file = create_file_and_parents(&of.output)?;
 	image.write_to(&mut file, ImageOutputFormat::Png)?;
 
